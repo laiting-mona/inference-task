@@ -1,0 +1,946 @@
+---
+title: "Inference Task"
+author: "Daniel Tsai"
+date: "2025-10-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(lubridate)
+library(janitor)
+library(sandwich)
+library(lmtest)
+library(broom)
+library(grf)
+library(glue)
+library(showtext)
+library(ggplot2)
+showtext_auto()
+set.seed(5166)
+
+# Configure knitr options for reproducible output
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  echo = TRUE,
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+```{r data-loading}
+# Load member and sales data
+members <- read_csv("members-group.csv")
+sales <- read_csv("sales-2024.csv")
+```
+
+## Compute purchase frequency and product preference
+```{r calculate-frequency}
+# Coerce quantity to numeric and drop non-positive
+sales_clean <- sales %>%
+  mutate(quantity = suppressWarnings(as.numeric(quantity))) %>%
+  filter(!is.na(quantity) & quantity > 0)
+
+# Total cups in 2024 (strictly > 0 per member)
+cups_2024 <- sales_clean %>%
+  mutate(member_id = as.character(member_id)) %>%
+  group_by(member_id) %>%
+  summarise(BaselineFreq = sum(quantity, na.rm = TRUE), .groups = "drop") %>%
+  filter(BaselineFreq > 0)
+
+# Tea vs Coffee preference
+category_pref <- sales_clean %>%
+  mutate(
+    member_id = as.character(member_id),
+    is_tea = category %in% c("調味茶", "奶茶"),
+    is_coffee = category %in% c("純咖啡", "調味咖啡")
+  ) %>%
+  group_by(member_id) %>%
+  summarise(
+    tea_cups = sum(quantity[is_tea], na.rm = TRUE),
+    coffee_cups = sum(quantity[is_coffee], na.rm = TRUE),
+    total_cups = sum(quantity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tea_ratio = tea_cups / total_cups,
+    coffee_ratio = coffee_cups / total_cups,
+    prefer_tea = tea_ratio > 0.5,
+    prefer_coffee = coffee_ratio > tea_ratio & !prefer_tea
+  ) %>%
+  filter(total_cups > 0)
+
+members_b <- members %>%
+  mutate(member_id = as.character(member_id)) %>% 
+  left_join(cups_2024, by = "member_id") %>%
+  left_join(category_pref, by = "member_id") %>%
+  mutate(
+    BaselineFreq = replace_na(BaselineFreq, 0),
+    total_cups = replace_na(total_cups, 0),
+    prefer_tea = replace_na(prefer_tea, FALSE),
+    prefer_coffee = replace_na(prefer_coffee, FALSE),
+    # Card ordering: Diamond, Gold, Silver
+    card_level = factor(card_level, levels = c("鑽石", "金", "銀")),
+    # English display labels
+    card_level_en = forcats::fct_recode(card_level,
+      Diamond = "鑽石", Gold = "金", Silver = "銀"
+    ),
+    gender_en = dplyr::recode(as.character(gender), "男" = "Male", "女" = "Female")
+  ) %>%
+  # Drop members with zero baseline cups and zero total cups
+  filter(BaselineFreq > 0, total_cups > 0)
+
+# Sanity check (should be 0)
+cat("Min BaselineFreq:", min(members_b$BaselineFreq, na.rm = TRUE), "\n")
+cat("# with BaselineFreq == 0:", sum(members_b$BaselineFreq == 0, na.rm = TRUE), "\n")
+cat("Min total_cups:", min(members_b$total_cups, na.rm = TRUE), "\n")
+cat("# with total_cups == 0:", sum(members_b$total_cups == 0, na.rm = TRUE), "\n")
+
+members_b %>%
+  summarise(
+    mean_cups = mean(BaselineFreq),
+    sd_cups   = sd(BaselineFreq),
+    median    = median(BaselineFreq),
+    max       = max(BaselineFreq)
+  ) %>%
+  kbl(caption = "Total Cups Bought per Member (2024)", digits = 2) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Convert birthday to age
+```{r convert-age}
+# Convert birthday to age
+members_b <- members_b %>%
+  mutate(
+    birthday = ymd(birthday),
+    Age = floor(interval(birthday, ymd("2024-12-31")) / years(1))
+  )
+```
+
+## 1-1 Balance check
+
+### Numeric variables
+```{r balance-numeric}
+# Balance check for numeric variables
+numeric_balance <- members_b %>%
+  group_by(CouponType) %>%
+  summarise(
+    n = n(),
+    mean_age = mean(Age, na.rm = TRUE),
+    sd_age   = sd(Age, na.rm = TRUE),
+    mean_freq = mean(BaselineFreq, na.rm = TRUE),
+    sd_freq   = sd(BaselineFreq, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+numeric_balance %>%
+  kbl(caption = "Balance Check – Numeric Variables (Age, BaselineFreq)", digits = 3) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r balance-plots}
+# Age distribution
+p1 <- ggplot(members_b, aes(x = Age, fill = CouponType)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Age Distribution by Coupon Type",
+       x = "Age", y = "Density")
+
+print(p1)
+
+# BaselineFreq distribution (strictly positive only)
+p2 <- ggplot(filter(members_b, BaselineFreq > 0), aes(x = BaselineFreq, fill = CouponType)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Purchase Frequency by Coupon Type",
+       x = "Total Cups (2024)", y = "Density")
+
+print(p2)
+```
+
+### Categorical variables
+```{r balance-categorical}
+# Gender composition by Coupon Type (English)
+if("gender_en" %in% names(members_b)) {
+  p3 <- ggplot(members_b, aes(x = CouponType, fill = gender_en)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = "Gender Composition by Coupon Type",
+      x = "Coupon Type",
+      y = "Share within Group (%)",
+      fill = "Gender"
+    )
+  print(p3)
+}
+
+if("card_level_en" %in% names(members_b)) {
+  members_b <- members_b %>% mutate(card_level_en = forcats::fct_relevel(card_level_en, "Diamond", "Gold", "Silver"))
+  p4 <- ggplot(members_b, aes(x = CouponType, fill = card_level_en)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("Diamond" = "#7b1fa2", "Gold" = "#fbc02d", "Silver" = "#90a4ae")) +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = "Membership Tier Composition by Coupon Type",
+      x = "Coupon Type",
+      y = "Share within Group (%)",
+      fill = "Tier"
+    )
+  print(p4)
+}
+```
+
+### Comprehensive balance table
+```{r comprehensive-balance-table}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(kableExtra)
+library(scales)
+
+df <- members_b
+
+# Define variable types for balance checks
+cont_vars <- c("Age", "BaselineFreq")
+cat_vars  <- c("card_level_en", "gender_en")
+group_var <- "CouponType"
+
+# Ensure group variable is character type
+df <- df %>% mutate(CouponType = as.character(.data[[group_var]]))
+
+# ============================================================================
+# Continuous variables: compute means, SDs, and perform t-tests
+# ============================================================================
+cont_summary <- map_dfr(cont_vars, function(var) {
+  stats <- df %>%
+    group_by(CouponType) %>%
+    summarise(
+      mean = mean(.data[[var]], na.rm = TRUE),
+      sd   = sd(.data[[var]], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Extract statistics for R and U groups
+  m_R  <- stats$mean[stats$CouponType == "R"]
+  sd_R <- stats$sd[stats$CouponType == "R"]
+  m_U  <- stats$mean[stats$CouponType == "U"]
+  sd_U <- stats$sd[stats$CouponType == "U"]
+
+  # Perform two-sample t-test
+  ttest <- tryCatch(
+    t.test(df[[var]] ~ df$CouponType),
+    error = function(e) NULL
+  )
+
+  tibble(
+    Variable = paste0("avg_", var),
+    Mean_R   = round(m_R, 3),
+    SD_R     = round(sd_R, 3),
+    Mean_U   = round(m_U, 3),
+    SD_U     = round(sd_U, 3),
+    Diff     = round(m_R - m_U, 3),
+    P_value  = if (!is.null(ttest)) round(ttest$p.value, 4) else NA_real_
+  )
+})
+
+# ============================================================================
+# Categorical variables: compute proportions and perform proportion tests
+# ============================================================================
+cat_summary <- map_dfr(cat_vars, function(v) {
+  if (!v %in% names(df)) return(tibble())
+  
+  prop_df <- df %>%
+    count(CouponType, !!sym(v), name = "n") %>%
+    group_by(CouponType) %>%
+    mutate(N_group = sum(n), prop = n / N_group) %>%
+    ungroup() %>%
+    rename(level = !!sym(v))
+
+  all_levels <- sort(unique(prop_df$level))
+
+  prop_full <- tidyr::expand_grid(CouponType = c("R","U"), level = all_levels) %>%
+    left_join(prop_df, by = c("CouponType","level")) %>%
+    mutate(
+      n = replace_na(n, 0),
+      N_group = ave(n, CouponType, FUN = function(x) rep(sum(x), length(x))),
+      prop = replace_na(prop, 0)
+    )
+
+  by_level <- prop_full %>%
+    arrange(level, CouponType) %>%
+    group_split(level)
+
+  map_dfr(by_level, function(g) {
+    r <- g %>% filter(CouponType == "R")
+    u <- g %>% filter(CouponType == "U")
+
+    pv <- tryCatch(
+      prop.test(x = c(r$n, u$n), n = c(r$N_group, u$N_group))$p.value,
+      error = function(e) NA_real_
+    )
+
+    se_R <- sqrt(r$prop * (1 - r$prop) / r$N_group)
+    se_U <- sqrt(u$prop * (1 - u$prop) / u$N_group)
+
+    tibble(
+      Variable = paste0("prop_", v, "=", as.character(r$level)),
+      Mean_R   = r$prop,
+      SD_R     = se_R,
+      Mean_U   = u$prop,
+      SD_U     = se_U,
+      Diff     = r$prop - u$prop,
+      P_value  = pv
+    )
+  })
+})
+
+# ============================================================================
+# Combine and format results for display
+# ============================================================================
+summary_table <- bind_rows(cont_summary, cat_summary) %>%
+  mutate(
+    P_value = format.pval(as.numeric(P_value), digits = 3, eps = 0.001)
+  )
+
+# Identify proportion rows for formatting
+is_prop <- grepl("^prop_", summary_table$Variable)
+
+summary_table_display <- summary_table %>%
+  mutate(
+    Mean_R  = ifelse(is_prop, percent(Mean_R, accuracy = 0.1), sprintf("%.3f", Mean_R)),
+    SD_R    = ifelse(is_prop, percent(SD_R,   accuracy = 0.1), sprintf("%.3f", SD_R)),
+    Mean_U  = ifelse(is_prop, percent(Mean_U, accuracy = 0.1), sprintf("%.3f", Mean_U)),
+    SD_U    = ifelse(is_prop, percent(SD_U,   accuracy = 0.1), sprintf("%.3f", SD_U)),
+    Diff    = ifelse(is_prop, percent(Diff,   accuracy = 0.1), sprintf("%.3f", Diff))
+  )
+
+# Apply human-readable variable names
+name_map <- c(
+  "avg_Age" = "Avg. Age",
+  "avg_BaselineFreq" = "Avg. Total Cups (2024)",
+  "prop_card_level_en=Diamond" = "% Diamond",
+  "prop_card_level_en=Gold" = "% Gold",
+  "prop_card_level_en=Silver" = "% Silver",
+  "prop_gender_en=Female" = "% Female",
+  "prop_gender_en=Male" = "% Male"
+)
+summary_table_display$Variable <- recode(summary_table_display$Variable, !!!name_map)
+
+# Render balance table
+kable(
+  summary_table_display,
+  format = "html",
+  col.names = c("Variable",
+                "Mean (R)", "SE (R)",
+                "Mean (U)", "SE (U)",
+                "Diff (R - U)", "p-value"),
+  align = c("l","c","c","c","c","c"),
+  booktabs = TRUE,
+  caption = "Summary Statistics by Coupon Type (R vs U)"
+) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover")) %>%
+  add_header_above(c(" " = 1, "R (Restricted)" = 2, "U (Universal)" = 2, "Comparison" = 2))
+```
+
+# Question 2
+
+```{r load-2025-data}
+# Load 2025 sales data for treatment effect analysis
+sales_2025 <- read_csv("sales-2025.csv")
+```
+
+## Preprocessing
+
+### Define treatment and control
+```{r define-treatment}
+# Create binary treatment indicator (R = 1, U = 0)
+members_b <- members_b %>%
+  mutate(
+    CouponType = as.character(CouponType),
+    treat = case_when(
+      CouponType %in% c("R") ~ 1,
+      TRUE ~ 0
+    )
+  )
+```
+
+## 2-1: ATE of R vs U on redemption
+
+```{r q2-1-ate-analysis}
+# =============================================================================
+# Average Treatment Effect on Redemption (without time fixed effects)
+# =============================================================================
+
+# Step 1: Identify members who redeemed birthday coupons
+redeem_2025 <- sales_2025 %>%
+  clean_names() %>%
+  mutate(
+    member_id          = as.character(member_id),
+    total_price        = suppressWarnings(as.numeric(total_price)),
+    is_birthday_coupon = suppressWarnings(as.integer(is_birthday_coupon))
+  ) %>%
+  filter(
+    payment_method == "Coupon",
+    coalesce(total_price, 0) == 0,
+    is_birthday_coupon == 1L
+  ) %>%
+  distinct(member_id) %>%
+  mutate(redeemed = 1L)
+
+# Step 2: Build analysis dataset with treatment and covariates
+df_q2 <- members_b %>%
+  mutate(
+    member_id = as.character(member_id),
+    CouponType = as.character(CouponType),
+    treat = if_else(toupper(CouponType) == "R", 1, 0),
+    Age = as.numeric(Age),
+    BaselineFreq = as.numeric(BaselineFreq)
+  ) %>%
+  left_join(redeem_2025, by = "member_id") %>%
+  mutate(redeemed = replace_na(redeemed, 0L),
+         gender = factor(gender),
+         card_level = factor(card_level))
+
+# Step 2.5: Sanity check - raw redemption rates by group
+redeem_rate <- df_q2 %>% group_by(CouponType) %>% summarise(rate = mean(redeemed), n = n(), .groups = "drop")
+cat("[Q2-1 Sanity Check] Redemption rate by group:\n"); print(redeem_rate)
+
+# =============================================================================
+# Estimation Method 1: Linear Regression with Robust Standard Errors
+# =============================================================================
+get_robust_treat_q21 <- function(data) {
+  m <- lm(redeemed ~ treat + Age + BaselineFreq + gender + card_level, data = data)
+  r <- coeftest(m, vcov = vcovHC(m, type = "HC1"))
+  # Robustly locate treatment coefficient
+  rn <- rownames(r)
+  tr_idx <- which(rn == "treat" | rn == "treat1" | rn == "treatTRUE")
+  if (length(tr_idx) == 0) stop("treat coefficient not found in model")
+  c(estimate = r[tr_idx, "Estimate"], se = r[tr_idx, "Std. Error"], p = r[tr_idx, "Pr(>|t|)"])
+}
+
+lm_vec <- get_robust_treat_q21(df_q2)
+lm_ate <- unname(lm_vec[["estimate"]])
+lm_se  <- unname(lm_vec[["se"]])
+lm_pval<- unname(lm_vec[["p"]])
+
+# =============================================================================
+# Estimation Method 2: Causal Forest (Machine Learning Approach)
+# =============================================================================
+mm <- model.matrix(~ Age + BaselineFreq + gender + card_level, data = df_q2)
+X <- mm[, -1, drop = FALSE]
+W <- as.numeric(df_q2$treat)
+Y <- as.numeric(df_q2$redeemed)
+
+# Remove incomplete cases and constant columns
+cc <- is.finite(rowSums(X)) & is.finite(W) & is.finite(Y)
+Xc <- X[cc, , drop = FALSE]
+Wc <- W[cc]
+Yc <- Y[cc]
+keep <- apply(Xc, 2, function(col) { v <- stats::var(col, na.rm = TRUE); is.finite(v) && !is.na(v) && v > 0 })
+Xc <- Xc[, keep, drop = FALSE]
+
+if (length(unique(Wc)) < 2 || stats::var(Yc) <= 0 || ncol(Xc) == 0) {
+  cf_ate <- NA_real_; cf_se <- NA_real_; cf_pval <- NA_real_
+} else {
+  set.seed(5166)
+  cf <- causal_forest(Xc, Yc, Wc, num.trees = 2000)
+  ate <- tryCatch(average_treatment_effect(cf), error = function(e) c(NA_real_, NA_real_))
+  cf_ate <- ate[1]; cf_se <- ate[2]
+  if (!is.finite(cf_ate) || !is.finite(cf_se) || cf_se == 0) {
+    tau <- tryCatch(as.numeric(predict(cf)$predictions), error = function(e) rep(NA_real_, length(Wc)))
+    cf_ate <- mean(tau, na.rm = TRUE)
+    cf_se  <- sd(tau, na.rm = TRUE)/sqrt(sum(is.finite(tau)))
+  }
+  cf_pval <- if (is.finite(cf_se) && cf_se > 0) 2*(1 - pnorm(abs(cf_ate/cf_se))) else NA_real_
+}
+
+# =============================================================================
+# Display results: ATE comparison table
+# =============================================================================
+ate_table <- tibble(
+  Method = c("Linear Regression (Robust SE)", "Causal Forest"),
+  ATE = c(lm_ate, cf_ate),
+  SE = c(lm_se, cf_se),
+  `95% CI Lower` = c(lm_ate - 1.96*lm_se, cf_ate - 1.96*cf_se),
+  `95% CI Upper` = c(lm_ate + 1.96*lm_se, cf_ate + 1.96*cf_se),
+  `p-value` = c(lm_pval, cf_pval)
+) %>%
+  dplyr::mutate(
+    ATE = sprintf("%.4f", .data$ATE),
+    SE = sprintf("%.4f", .data$SE),
+    `95% CI Lower` = sprintf("%.4f", .data[["95% CI Lower"]]),
+    `95% CI Upper` = sprintf("%.4f", .data[["95% CI Upper"]]),
+    `p-value` = format.pval(.data[["p-value"]], digits = 3, eps = 0.001)
+  )
+
+kable(
+  ate_table,
+  format = "html",
+  caption = "2-1: Average Treatment Effect of Restricted vs Universal Coupon on Redemption",
+  align = c("l", "c", "c", "c", "c", "c")
+) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  column_spec(1, bold = TRUE)
+
+# =============================================================================
+# Causal Forest: Variable Importance Analysis
+# =============================================================================
+if (exists("cf") && inherits(cf, "causal_forest") && exists("Xc")) {
+  vi <- tryCatch(variable_importance(cf), error = function(e) NULL)
+  if (!is.null(vi)) {
+    fn <- tryCatch(colnames(Xc), error = function(e) NULL)
+    if (!is.null(fn) && length(fn) == length(vi)) names(vi) <- fn
+
+    vi_tbl <- tibble(
+      Feature = if (!is.null(names(vi))) names(vi) else paste0("X", seq_along(vi)),
+      Importance = as.numeric(vi)
+    ) %>%
+      dplyr::arrange(dplyr::desc(.data$Importance)) %>%
+      dplyr::mutate(Share = .data$Importance / sum(.data$Importance))
+
+    kable(
+      vi_tbl %>% dplyr::mutate(
+        Importance = sprintf("%.3f", .data$Importance),
+        Share = scales::percent(.data$Share, accuracy = 0.1)
+      ),
+      format = "html",
+      caption = "2-1: Feature Importance in Causal Forest Model",
+      col.names = c("Feature", "Importance", "Share of Total"),
+      align = c("l", "c", "c")
+    ) %>%
+      kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+    # Prepare data for plotting to avoid NSE warnings
+    vi_tbl_plot <- vi_tbl %>% dplyr::mutate(Feature_ord = factor(.data$Feature, levels = rev(.data$Feature)))
+
+    suppressWarnings({
+      ggplot(vi_tbl_plot, aes(x = .data$Feature_ord, y = .data$Importance)) +
+        geom_col(fill = "#4a90e2") +
+        coord_flip() +
+        theme_minimal() +
+        labs(title = "Feature Importance for Treatment Effect Heterogeneity", 
+             subtitle = "Higher values indicate stronger influence on treatment effect variation",
+             x = "Feature", y = "Importance Score") %>%
+        print()
+    })
+  }
+}
+
+cat("\n=== Key Findings ===\n")
+cat(sprintf("Linear Regression ATE: %.4f (SE = %.4f)\n", lm_ate, lm_se))
+cat(sprintf("Causal Forest ATE: %.4f (SE = %.4f)\n", cf_ate, cf_se))
+cat(sprintf("\nInterpretation: Restricted coupons change redemption probability by %.2f percentage points compared to Universal coupons.\n",
+            abs(lm_ate) * 100))
+
+```  
+# Subgroup Analysis: Heterogeneous Treatment Effects
+```{r q2-subgroup-helpers}
+# =============================================================================
+# Helper Function: Subgroup HTE Analysis (LM uses interaction term)
+# =============================================================================
+build_subgroup_table <- function(df_in, outcome, title) {
+  require(tidyverse)
+  require(sandwich)
+  require(lmtest)
+  require(grf)
+  require(kableExtra)
+
+  # setting S
+  baseline_median <- stats::median(df_in$BaselineFreq, na.rm = TRUE)
+  df <- df_in %>%
+    mutate(
+      .row_id     = dplyr::row_number(),
+      age_under45 = .data$Age < 45,
+      freq_high   = .data$BaselineFreq >= baseline_median
+    )
+
+  # ---- Linear： model with interaction term
+ lm_interact <- function(df_full, dsub, ctrls = c("Age","BaselineFreq","gender","card_level")) {
+  S_ids <- dsub$.row_id
+  d_model <- df_full %>% mutate(S = as.integer(.row_id %in% S_ids))
+  keep_ctrls <- ctrls[vapply(ctrls, function(v) dplyr::n_distinct(d_model[[v]]) > 1, logical(1))]
+  fml <- as.formula(paste(outcome, "~", paste(c("treat","S","treat:S", keep_ctrls), collapse = " + ")))
+
+  # Helper to pick coefficient name
+  pick_name <- function(cands, pool) {
+    cand <- intersect(cands, pool)
+    if (length(cand)) cand[1] else NA_character_
+  }
+
+  out <- tryCatch({
+    m   <- lm(fml, data = d_model)
+    # robust vcov
+    V   <- sandwich::vcovHC(m, type = "HC1")
+    b   <- coef(m)
+    bn  <- names(b)
+
+    nm_treat <- pick_name(c("treat","treat1","treatTRUE"), bn)
+    nm_int   <- pick_name(c("treat:S","S:treat","treat1:S","treatTRUE:S","treat:S1","S1:treat"), bn)
+
+    b_treat <- if (!is.na(nm_treat)) unname(b[[nm_treat]]) else NA_real_
+    b_int   <- if (!is.na(nm_int))   unname(b[[nm_int]])   else NA_real_
+
+    # CATE for subgroup S=1 : tau + gamma
+    cate_S1 <- b_treat + b_int
+    # robust SE via delta method: Var(treat)+Var(int)+2Cov(treat,int)
+    se_S1 <- tryCatch({
+      if (any(is.na(c(nm_treat, nm_int)))) NA_real_ else {
+        sqrt(V[nm_treat, nm_treat] + V[nm_int, nm_int] + 2*V[nm_treat, nm_int])
+      }
+    }, error = function(e) NA_real_)
+
+  
+    cate_S0 <- b_treat
+    se_S0 <- tryCatch({
+      if (is.na(nm_treat)) NA_real_ else sqrt(V[nm_treat, nm_treat])
+    }, error = function(e) NA_real_)
+
+  
+    z_S1 <- if (is.finite(cate_S1) && is.finite(se_S1) && se_S1 > 0) cate_S1 / se_S1 else NA_real_
+    p_S1 <- if (is.finite(z_S1)) 2*(1 - pnorm(abs(z_S1))) else NA_real_
+
+    list(cate_S1 = cate_S1, se_S1 = se_S1, p_S1 = p_S1,
+         cate_S0 = cate_S0, se_S0 = se_S0)
+  }, error = function(e) {
+    list(cate_S1 = NA_real_, se_S1 = NA_real_, p_S1 = NA_real_,
+         cate_S0 = NA_real_, se_S0 = NA_real_)
+  })
+
+  out
+}
+
+
+  # ---- Causal forest
+  cf_treat <- function(d) {
+    mm <- model.matrix(~ Age + BaselineFreq + gender + card_level, data = d)
+    X <- mm[, -1, drop = FALSE]
+    W <- as.numeric(d$treat)
+    Y <- as.numeric(d[[outcome]])
+    cc <- is.finite(rowSums(X)) & is.finite(W) & is.finite(Y)
+    Xc <- X[cc, , drop = FALSE]; Wc <- W[cc]; Yc <- Y[cc]
+    if (length(Wc) == 0) return(list(te = NA_real_, se = NA_real_, n_cf = 0))
+    keep <- apply(Xc, 2, function(col) { v <- stats::var(col, na.rm = TRUE); is.finite(v) && !is.na(v) && v > 0 })
+    if (!any(keep)) return(list(te = NA_real_, se = NA_real_, n_cf = length(Wc)))
+    Xc <- Xc[, keep, drop = FALSE]
+    if (length(unique(Wc)) < 2 || stats::var(Yc) <= 0) return(list(te = NA_real_, se = NA_real_, n_cf = length(Wc)))
+    set.seed(5166)
+    out <- tryCatch({
+      cf <- grf::causal_forest(Xc, Yc, Wc, num.trees = 2000)
+      ate <- tryCatch(grf::average_treatment_effect(cf), error = function(e) c(NA_real_, NA_real_))
+      te <- ate[1]; se <- ate[2]
+      if (!is.finite(se) || se == 0) {
+        tau <- tryCatch(as.numeric(predict(cf)$predictions), error = function(e) rep(NA_real_, length(Wc)))
+        te <- mean(tau, na.rm = TRUE)
+        se <- stats::sd(tau, na.rm = TRUE) / sqrt(sum(is.finite(tau)))
+      }
+      list(te = te, se = se, n_cf = length(Wc))
+    }, error = function(e) list(te = NA_real_, se = NA_real_, n_cf = length(Wc)))
+    out
+  }
+
+  # ---- Prepare rows
+  rows <- list()
+  add_row <- function(category, label, dsub) {
+    n <- nrow(dsub)
+    if (n == 0) return(NULL)
+    lmres <- lm_interact(df, dsub) 
+    cfres <- cf_treat(dsub) 
+    rows[[length(rows) + 1]] <<- tibble(
+  Category = category,
+  Subgroup = label,
+  N = n,
+  TE_LM = lmres$cate_S1,  
+  SE_LM = lmres$se_S1,
+  P_LM  = lmres$p_S1,
+  TE_CF = cfres$te,
+  SE_CF = cfres$se,
+  `N (CF)` = cfres$n_cf
+)
+
+  }
+
+  # ---- Define subgroups and collect results
+  add_row("Age Group", "Under 45",      df %>% dplyr::filter(.data$age_under45))
+  add_row("Age Group", "45 and above",  df %>% dplyr::filter(!.data$age_under45))
+
+  add_row("Product Preference", "Tea",   df %>% dplyr::filter(.data$prefer_tea == TRUE))
+  add_row("Product Preference", "Coffee",df %>% dplyr::filter(.data$prefer_coffee == TRUE))
+
+  map_cn_en <- c("鑽石" = "Diamond", "金" = "Gold", "銀" = "Silver")
+  for (cn in names(map_cn_en)) {
+    add_row("Card Level", map_cn_en[[cn]], df %>% dplyr::filter(as.character(.data$card_level) == cn))
+  }
+
+  add_row("Purchase Frequency", "Above median", df %>% dplyr::filter(.data$freq_high))
+  add_row("Purchase Frequency", "Below median", df %>% dplyr::filter(!.data$freq_high))
+
+  out <- dplyr::bind_rows(rows)
+
+  # ---- Display table 
+  out_disp <- out %>%
+    dplyr::mutate(
+      TE_LM = ifelse(is.finite(.data$TE_LM), sprintf("%.4f", .data$TE_LM), "NA"),
+      SE_LM = ifelse(is.finite(.data$SE_LM), sprintf("%.4f", .data$SE_LM), "NA"),
+      P_LM  = ifelse(is.finite(.data$P_LM),  format.pval(.data$P_LM, digits = 3, eps = 0.001), "NA"),
+      TE_CF = ifelse(is.finite(.data$TE_CF), sprintf("%.4f", .data$TE_CF), "NA"),
+      SE_CF = ifelse(is.finite(.data$SE_CF), sprintf("%.4f", .data$SE_CF), "NA")
+    )
+
+  kable(
+    out_disp,
+    format = "html",
+    col.names = c("Category","Subgroup","Sample Size",
+                  "Effect ","Std. Error","p-value",
+                  "Effect ","Std. Error","CF Sample"),
+    caption = title,
+    align = c("l","l","r","r","r","c","r","r","r")
+  ) %>%
+    add_header_above(c(" " = 2, " " = 1,
+                       "Linear Model (Interaction: treat×S)" = 3,
+                       "Causal Forest" = 3)) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover")) %>%
+    print()
+
+  invisible(out)
+}
+
+```
+
+```{r q2-1-subgroup-tables}
+# Analyze heterogeneous treatment effects across predefined subgroups
+build_subgroup_table(df_q2, outcome = "redeemed", title = "2-1: Heterogeneous Treatment Effects on Redemption by Subgroup")
+```
+
+
+
+## 2-2: Post-1-month outcomes (Spend, Visits, Cups) — ATE and HTE
+
+```{r q2-2-hte-helpers}
+# =============================================================================
+# Helper Functions for Q2-2: HTE estimation on post-period outcomes
+# =============================================================================
+
+# Linear model with full interaction terms
+fit_lm_hte <- function(outcome, df) {
+  f <- stats::as.formula(paste0(
+    outcome,
+    " ~ treat + Age + BaselineFreq + gender + card_level + age_under45 + tea50 + coffee_pref + freq_high"
+  ))
+  m <- lm(f, data = df)
+  r <- lmtest::coeftest(m, vcov = sandwich::vcovHC(m, type = "HC1"))
+  rn <- rownames(r)
+  tr_idx <- which(rn %in% c("treat", "treat1", "treatTRUE"))
+  if (length(tr_idx) == 0) stop("treat coefficient not found in model for ", outcome)
+  list(
+    method = "Linear Regression (Robust SE)",
+    ate = unname(r[tr_idx, "Estimate"]),
+    se  = unname(r[tr_idx, "Std. Error"]),
+    p   = unname(r[tr_idx, "Pr(>|t|)"])
+  )
+}
+
+# Causal forest with expanded feature set
+fit_cf_hte <- function(outcome, df) {
+  mm <- model.matrix(~ Age + BaselineFreq + gender + card_level + age_under45 + tea50 + coffee_pref + freq_high, data = df)
+  X <- mm[, -1, drop = FALSE]
+  W <- as.numeric(df$treat)
+  Y <- as.numeric(df[[outcome]])
+
+  cc <- is.finite(rowSums(X)) & is.finite(W) & is.finite(Y)
+  Xc <- X[cc, , drop = FALSE]
+  Wc <- W[cc]
+  Yc <- Y[cc]
+  keep <- apply(Xc, 2, function(col) { v <- stats::var(col, na.rm = TRUE); is.finite(v) && !is.na(v) && v > 0 })
+  Xc <- Xc[, keep, drop = FALSE]
+
+  if (length(unique(Wc)) < 2 || stats::var(Yc) <= 0 || ncol(Xc) == 0) {
+    return(list(method = "Causal Forest", ate = NA_real_, se = NA_real_, p = NA_real_, forest = NULL, feature_names = colnames(Xc)))
+  }
+
+  set.seed(5166)
+  cf <- grf::causal_forest(Xc, Yc, Wc, num.trees = 2000)
+  ate <- tryCatch(grf::average_treatment_effect(cf), error = function(e) c(NA_real_, NA_real_))
+  cf_ate <- ate[1]; cf_se <- ate[2]
+  if (!is.finite(cf_ate) || !is.finite(cf_se) || cf_se == 0) {
+    tau <- tryCatch(as.numeric(predict(cf)$predictions), error = function(e) rep(NA_real_, length(Wc)))
+    cf_ate <- mean(tau, na.rm = TRUE)
+    cf_se  <- stats::sd(tau, na.rm = TRUE) / sqrt(sum(is.finite(tau)))
+  }
+  cf_pval <- if (is.finite(cf_se) && cf_se > 0) 2 * (1 - pnorm(abs(cf_ate / cf_se))) else NA_real_
+
+  list(method = "Causal Forest", ate = cf_ate, se = cf_se, p = cf_pval, forest = cf, feature_names = colnames(Xc))
+}
+
+# Render ATE comparison table
+render_hte_table <- function(lm_res, cf_res, title) {
+  tab <- tibble(
+    Method = c("Linear Regression (Robust SE)", "Causal Forest"),
+    ATE = c(lm_res$ate, cf_res$ate),
+    SE = c(lm_res$se, cf_res$se),
+    `95% CI Lower` = c(lm_res$ate - 1.96 * lm_res$se, cf_res$ate - 1.96 * cf_res$se),
+    `95% CI Upper` = c(lm_res$ate + 1.96 * lm_res$se, cf_res$ate + 1.96 * cf_res$se),
+    `p-value` = c(lm_res$p, cf_res$p)
+  ) %>%
+    dplyr::mutate(
+      ATE = sprintf("%.4f", .data$ATE),
+      SE = sprintf("%.4f", .data$SE),
+      `95% CI Lower` = sprintf("%.4f", .data[["95% CI Lower"]]),
+      `95% CI Upper` = sprintf("%.4f", .data[["95% CI Upper"]]),
+      `p-value` = format.pval(.data[["p-value"]], digits = 3, eps = 0.001)
+    )
+
+  kable(
+    tab,
+    format = "html",
+    caption = title,
+    align = c("l", "c", "c", "c", "c", "c")
+  ) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    column_spec(1, bold = TRUE) %>%
+    print()
+}
+
+# Render feature importance from causal forest
+render_cf_importance <- function(cf_res, title_prefix) {
+  if (is.null(cf_res$forest)) return(invisible(NULL))
+  vi <- tryCatch(grf::variable_importance(cf_res$forest), error = function(e) NULL)
+  if (is.null(vi)) return(invisible(NULL))
+  if (!is.null(cf_res$feature_names) && length(cf_res$feature_names) == length(vi)) names(vi) <- cf_res$feature_names
+
+  vi_tbl <- tibble(
+    Feature = if (!is.null(names(vi))) names(vi) else paste0("X", seq_along(vi)),
+    Importance = as.numeric(vi)
+  ) %>%
+    dplyr::arrange(dplyr::desc(.data$Importance)) %>%
+    dplyr::mutate(Share = .data$Importance / sum(.data$Importance))
+
+  kable(
+    vi_tbl %>% dplyr::mutate(
+      Importance = sprintf("%.3f", .data$Importance),
+      Share = scales::percent(.data$Share, accuracy = 0.1)
+    ),
+    format = "html",
+    caption = paste0(title_prefix, ": Feature Importance for Treatment Effect Variation"),
+    col.names = c("Feature", "Importance Score", "Share of Total"),
+    align = c("l", "c", "c")
+  ) %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+    print()
+
+  vi_tbl_plot <- vi_tbl %>% dplyr::mutate(Feature_ord = factor(.data$Feature, levels = rev(.data$Feature)))
+
+  suppressWarnings({
+    ggplot(vi_tbl_plot, aes(x = .data$Feature_ord, y = .data$Importance)) +
+      geom_col(fill = "#4a90e2") +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = paste0(title_prefix, ": Feature Importance Distribution"), 
+           subtitle = "Higher scores indicate stronger predictive power for treatment heterogeneity",
+           x = "Feature", y = "Importance Score") %>%
+      print()
+  })
+}
+```
+
+```{r q2-2-post-outcomes}
+# =============================================================================
+# Step 0: Calculate post-period outcomes (cups, spending, visits)
+# =============================================================================
+post_paid <- sales_2025 %>%
+  clean_names() %>%
+  mutate(
+    member_id   = as.character(member_id),
+    total_price = suppressWarnings(as.numeric(total_price)),
+    quantity    = suppressWarnings(as.numeric(quantity))
+  ) %>%
+  filter(
+    is_post_window == 1,
+    coalesce(total_price, 0) > 0,
+    coalesce(quantity, 0) > 0
+  ) %>%
+  group_by(member_id) %>%
+  summarise(
+    cups_post   = sum(coalesce(quantity, 0), na.rm = TRUE),
+    spend_post  = sum(coalesce(total_price, 0), na.rm = TRUE),
+    visits_post = n_distinct(transaction_id),
+    .groups = "drop"
+  )
+
+# Merge post-period outcomes with main analysis dataset
+df_q2 <- df_q2 %>%
+  left_join(post_paid, by = "member_id") %>%
+  mutate(
+    cups_post   = replace_na(cups_post, 0),
+    spend_post  = replace_na(spend_post, 0),
+    visits_post = replace_na(visits_post, 0)
+  )
+
+# =============================================================================
+# Build enhanced analysis dataset with interaction terms
+# =============================================================================
+baseline_median <- median(df_q2$BaselineFreq, na.rm = TRUE)
+
+df_ht2 <- df_q2 %>%
+  mutate(
+    age_under45  = as.integer(Age < 45),
+    tea50        = as.integer(prefer_tea),
+    coffee_pref  = as.integer(prefer_coffee),
+    freq_high    = as.integer(BaselineFreq >= baseline_median),
+    card_level   = factor(card_level)
+  )
+
+# ...existing code...
+# =============================================================================
+# Build enhanced analysis dataset with interaction terms
+# =============================================================================
+baseline_median <- median(df_q2$BaselineFreq, na.rm = TRUE)
+
+df_ht2 <- df_q2 %>%
+  mutate(
+    age_under45  = as.integer(Age < 45),
+    tea50        = as.integer(prefer_tea),
+    coffee_pref  = as.integer(prefer_coffee),
+    freq_high    = as.integer(BaselineFreq >= baseline_median),
+    card_level   = factor(card_level)
+  )
+if ("銀" %in% levels(df_ht2$card_level)) df_ht2$card_level <- stats::relevel(df_ht2$card_level, ref = "銀")
+stopifnot(all(c("cups_post","spend_post","visits_post") %in% names(df_ht2)))
+
+# =============================================================================
+# Outcome 1: Post-period spending
+# =============================================================================
+lm_spend  <- fit_lm_hte("spend_post", df_ht2)
+cf_spend  <- fit_cf_hte("spend_post", df_ht2)
+render_hte_table(lm_spend, cf_spend, "Treatment Effect on Post-Period Total Spending")
+render_cf_importance(cf_spend, "Post-Period Spending")
+
+# =============================================================================
+# Outcome 2: Post-period visit frequency
+# =============================================================================
+lm_visits <- fit_lm_hte("visits_post", df_ht2)
+cf_visits <- fit_cf_hte("visits_post", df_ht2)
+render_hte_table(lm_visits, cf_visits, "Treatment Effect on Post-Period Visit Frequency")
+render_cf_importance(cf_visits, "Post-Period Visits")
+
+# =============================================================================
+# Outcome 3: Post-period cups purchased
+# =============================================================================
+lm_cups   <- fit_lm_hte("cups_post", df_ht2)
+cf_cups   <- fit_cf_hte("cups_post", df_ht2)
+render_hte_table(lm_cups, cf_cups, "Treatment Effect on Post-Period Cups Purchased")
+render_cf_importance(cf_cups, "Post-Period Cups")
+
+# =============================================================================
+# Subgroup analysis for all three post-period outcomes
+# =============================================================================
+build_subgroup_table(df_ht2, outcome = "spend_post",  title = "2-2: HTE on Post-Period Spending by Subgroup")
+build_subgroup_table(df_ht2, outcome = "visits_post", title = "2-2: HTE on Post-Period Visits by Subgroup")
+build_subgroup_table(df_ht2, outcome = "cups_post",   title = "2-2: HTE on Post-Period Cups by Subgroup")
+```
+
